@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart' show QuerySnapshot;
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 
 import '../ui.dart';
@@ -8,8 +10,7 @@ import 'receive_dialog.dart';
 import 'send_screen.dart';
 
 class WalletScreen extends StatefulWidget {
-  const WalletScreen({super.key, required this.wallet});
-  final Wallet wallet;
+  const WalletScreen({super.key});
 
   @override
   State<WalletScreen> createState() => _WalletScreenState();
@@ -17,8 +18,6 @@ class WalletScreen extends StatefulWidget {
 
 class _WalletScreenState extends State<WalletScreen> {
   TxType? _filter; // null = All
-
-  Wallet get wallet => widget.wallet;
 
   void _toast(String message, {bool error = false, SnackBarAction? action}) {
     ScaffoldMessenger.of(context)
@@ -37,32 +36,44 @@ class _WalletScreenState extends State<WalletScreen> {
   }
 
   Future<void> _receive() async {
-    final message = await showReceiveDialog(context, wallet);
+    final message = await showReceiveDialog(context);
     if (message != null && mounted) _toast(message);
   }
 
-  /// Called after a successful delete, from a swipe or the details screen.
-  void showUndo(Deletion deletion) {
-    final what = deletion.removed.length > 1
-        ? '${deletion.removed.first.description} (and its fee)'
-        : deletion.removed.first.description;
-    _toast(
-      'Deleted: $what',
-      action: SnackBarAction(
-        label: 'UNDO',
-        onPressed: () {
-          final result = wallet.undo(deletion);
-          if (!result.ok) _toast(result.error!, error: true);
-        },
-      ),
+  Future<void> _openDetails(WalletData data, Transaction tx) async {
+    final message = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => DetailsScreen(data: data, tx: tx)),
     );
+    if (message != null && mounted) _toast(message);
   }
 
-  Future<void> _openDetails(Transaction tx) async {
-    final deletion = await Navigator.of(context).push<Deletion>(
-      MaterialPageRoute(builder: (_) => DetailsScreen(wallet: wallet, tx: tx)),
+  /// Asks, then deletes. Always returns false: the Firestore stream removes
+  /// the tile, so the Dismissible is never left dismissed inside the tree.
+  Future<bool> _deleteWithConfirm(
+      BuildContext context, WalletData data, Transaction tx) async {
+    final sure = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete this transaction?'),
+        content: Text(tx.description),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Delete')),
+        ],
+      ),
     );
-    if (deletion != null && mounted) showUndo(deletion);
+    if (sure != true) return false;
+    try {
+      await deleteTransaction(tx, fee: data.feeOf(tx));
+      if (mounted) _toast('Deleted: ${tx.description}');
+    } catch (e) {
+      if (mounted) _toast('Could not delete: $e', error: true);
+    }
+    return false;
   }
 
   @override
@@ -71,11 +82,33 @@ class _WalletScreenState extends State<WalletScreen> {
       appBar: AppBar(
         backgroundColor: momoYellow,
         title: const Text('MoMo Wallet', style: TextStyle(fontWeight: FontWeight.w800)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Log out',
+            onPressed: () => FirebaseAuth.instance.signOut(),
+          ),
+        ],
       ),
-      body: ListenableBuilder(
-        listenable: wallet,
-        builder: (context, _) {
-          final txs = wallet.newestFirst(filter: _filter);
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream:
+            myTransactions().orderBy('createdAt', descending: true).snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text('Could not load your transactions.\n${snapshot.error}',
+                    textAlign: TextAlign.center),
+              ),
+            );
+          }
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final data = WalletData(
+              snapshot.data!.docs.map(Transaction.fromDoc).toList());
+          final txs = data.newestFirst(filter: _filter);
           return Center(
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 640),
@@ -85,13 +118,13 @@ class _WalletScreenState extends State<WalletScreen> {
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
                     sliver: SliverList.list(children: [
                       _BalanceCard(
-                        balance: wallet.balance,
+                        balance: data.balance,
                         onReceive: _receive,
-                        onSend: () => _open(SendScreen(wallet: wallet)),
-                        onCashOut: () => _open(CashOutScreen(wallet: wallet)),
+                        onSend: () => _open(SendScreen(data: data)),
+                        onCashOut: () => _open(CashOutScreen(data: data)),
                       ),
                       const SizedBox(height: 12),
-                      _StatsRow(wallet: wallet),
+                      _StatsRow(data: data),
                       const SizedBox(height: 20),
                       Row(
                         children: [
@@ -131,20 +164,8 @@ class _WalletScreenState extends State<WalletScreen> {
                         itemBuilder: (context, i) => _TxTile(
                           key: ValueKey(txs[i].id),
                           tx: txs[i],
-                          onTap: () => _openDetails(txs[i]),
-                          canDelete: () {
-                            final reason = wallet.whyCannotDelete(txs[i].id);
-                            if (reason != null) _toast(reason, error: true);
-                            return reason == null;
-                          },
-                          onDelete: () {
-                            final result = wallet.delete(txs[i].id);
-                            if (result.ok) {
-                              showUndo(result.value!);
-                            } else {
-                              _toast(result.error!, error: true);
-                            }
-                          },
+                          onTap: () => _openDetails(data, txs[i]),
+                          onDelete: () => _deleteWithConfirm(context, data, txs[i]),
                         ),
                       ),
                     ),
@@ -251,18 +272,18 @@ class _CardAction extends StatelessWidget {
 }
 
 class _StatsRow extends StatelessWidget {
-  const _StatsRow({required this.wallet});
-  final Wallet wallet;
+  const _StatsRow({required this.data});
+  final WalletData data;
 
   @override
   Widget build(BuildContext context) {
     return Row(
       children: [
-        _Stat(key: const Key('stat-in'), label: 'Total IN', value: wallet.totalIn, color: inGreen),
+        _Stat(key: const Key('stat-in'), label: 'Total IN', value: data.totalIn, color: inGreen),
         const SizedBox(width: 8),
-        _Stat(key: const Key('stat-out'), label: 'Total OUT', value: wallet.totalOut, color: outRed),
+        _Stat(key: const Key('stat-out'), label: 'Total OUT', value: data.totalOut, color: outRed),
         const SizedBox(width: 8),
-        _Stat(key: const Key('stat-low'), label: 'Lowest balance', value: wallet.lowestBalance, color: momoBlue),
+        _Stat(key: const Key('stat-low'), label: 'Lowest balance', value: data.lowestBalance, color: momoBlue),
       ],
     );
   }
@@ -310,14 +331,12 @@ class _TxTile extends StatelessWidget {
     super.key,
     required this.tx,
     required this.onTap,
-    required this.canDelete,
     required this.onDelete,
   });
 
   final Transaction tx;
   final VoidCallback onTap;
-  final bool Function() canDelete;
-  final VoidCallback onDelete;
+  final Future<bool> Function() onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -327,8 +346,7 @@ class _TxTile extends StatelessWidget {
       child: Dismissible(
         key: ValueKey('dismiss-${tx.id}'),
         direction: DismissDirection.endToStart,
-        confirmDismiss: (_) async => canDelete(),
-        onDismissed: (_) => onDelete(),
+        confirmDismiss: (_) => onDelete(),
         background: Container(
           alignment: Alignment.centerRight,
           padding: const EdgeInsets.only(right: 20),
@@ -346,7 +364,7 @@ class _TxTile extends StatelessWidget {
               child: Icon(tx.isIn ? Icons.south_west : Icons.north_east, color: color, size: 20),
             ),
             title: Text(tx.description, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: Text(formatDate(tx.date)),
+            subtitle: Text(dateLabel(tx)),
             trailing: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.end,

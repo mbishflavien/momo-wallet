@@ -4,8 +4,8 @@ import '../ui.dart';
 import '../wallet.dart';
 
 class SendScreen extends StatefulWidget {
-  const SendScreen({super.key, required this.wallet});
-  final Wallet wallet;
+  const SendScreen({super.key, required this.data});
+  final WalletData data;
 
   @override
   State<SendScreen> createState() => _SendScreenState();
@@ -15,6 +15,7 @@ class _SendScreenState extends State<SendScreen> {
   final _phone = TextEditingController();
   final _amount = TextEditingController();
   String? _error;
+  bool _busy = false;
 
   @override
   void dispose() {
@@ -23,15 +24,44 @@ class _SendScreenState extends State<SendScreen> {
     super.dispose();
   }
 
-  void _send() {
-    final result = widget.wallet.send(_phone.text, _amount.text);
-    if (!result.ok) {
-      setState(() => _error = result.error);
+  Future<void> _send() async {
+    final phoneError = validatePhone(_phone.text);
+    if (phoneError != null) {
+      setState(() => _error = phoneError);
       return;
     }
-    final tx = result.value!;
-    Navigator.of(context).pop(
-        '${tx.description}: ${formatRwf(tx.amount)} RWF (+ ${formatRwf(sendFee)} RWF fee)');
+    final amount = parseAmount(_amount.text);
+    if (!amount.ok) {
+      setState(() => _error = amount.error);
+      return;
+    }
+    if (amount.value! < minSend) {
+      setState(() => _error = 'Minimum send amount is ${formatRwf(minSend)} RWF');
+      return;
+    }
+    if (amount.value! + sendFee > widget.data.balance) {
+      setState(() => _error = 'Insufficient balance');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final phone = _phone.text.trim();
+    try {
+      await addSend(phone: phone, amount: amount.value!);
+      if (!mounted) return;
+      Navigator.of(context).pop(
+          'Sent ${formatRwf(amount.value!)} RWF to $phone (+ ${formatRwf(sendFee)} RWF fee)');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = 'Could not send: $e';
+        });
+      }
+    }
   }
 
   @override
@@ -45,7 +75,7 @@ class _SendScreenState extends State<SendScreen> {
           child: ListView(
             padding: const EdgeInsets.all(16),
             children: [
-              AvailableBalance(widget.wallet),
+              AvailableBalance(widget.data.balance),
               const SizedBox(height: 16),
               TextField(
                 key: const Key('send-phone'),
@@ -94,7 +124,7 @@ class _SendScreenState extends State<SendScreen> {
               16, 8, 16, 12 + MediaQuery.viewInsetsOf(context).bottom),
           child: FilledButton.icon(
             key: const Key('send-button'),
-            onPressed: _send,
+            onPressed: _busy ? null : _send,
             icon: const Icon(Icons.send),
             label: const Padding(
               padding: EdgeInsets.symmetric(vertical: 12),

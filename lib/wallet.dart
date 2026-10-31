@@ -1,4 +1,5 @@
-import 'package:flutter/foundation.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 /// Direction of a transaction: money coming IN or going OUT.
 enum TxType {
@@ -15,29 +16,50 @@ class Transaction {
     required this.type,
     required this.amount,
     required this.description,
-    required this.date,
+    this.createdAt,
     this.feeFor,
   });
 
-  /// Ids grow with time, so they also give the chronological order.
-  final int id;
+  /// The Firestore document id.
+  final String id;
   final TxType type;
   final int amount;
   final String description;
-  final DateTime date;
 
-  /// If this is a send fee, the id of the send it belongs to.
-  final int? feeFor;
+  /// Written by the server with [FieldValue.serverTimestamp].
+  final DateTime? createdAt;
+
+  /// If this is a send fee, the id of the send document it belongs to.
+  final String? feeFor;
 
   bool get isIn => type == TxType.incoming;
   bool get isFee => feeFor != null;
   int get signedAmount => isIn ? amount : -amount;
-}
 
-/// What was removed by a delete, so it can be put back with Undo.
-class Deletion {
-  const Deletion(this.removed);
-  final List<Transaction> removed;
+  /// Only the facts the user typed or chose are saved.
+  Map<String, dynamic> toMap() => {
+        'description': description,
+        'amount': amount,
+        'type': type.name,
+        if (feeFor != null) 'feeFor': feeFor,
+      };
+
+  factory Transaction.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
+    final rawType = data['type'] as String?;
+    final legacyIsIn = data['isIn'] as bool?;
+    final type = rawType == 'incoming' || (rawType == null && legacyIsIn == true)
+        ? TxType.incoming
+        : TxType.outgoing;
+    return Transaction(
+      id: doc.id,
+      type: type,
+      amount: (data['amount'] as num).toInt(),
+      description: data['description'] as String? ?? '',
+      createdAt: (data['createdAt'] as Timestamp?)?.toDate(),
+      feeFor: data['feeFor'] as String?,
+    );
+  }
 }
 
 /// The notes an agent hands over for a cash out, biggest first.
@@ -132,232 +154,159 @@ Map<int, int> splitIntoNotes(int amount) {
   return notes;
 }
 
-class Wallet extends ChangeNotifier {
-  Wallet({
-    this.openingBalance = 10000,
-    List<Transaction>? history,
-    DateTime Function()? clock,
-  })  : _txs = [...?history],
-        _clock = clock ?? DateTime.now {
-    _nextId = _txs.fold(0, (m, t) => t.id > m ? t.id : m) + 1;
-    if (_runningBalances(_txs) == null) {
-      throw ArgumentError('history makes the balance go below 0');
+/// Everything computed from a user's saved transactions.
+///
+/// Balance, totals and the lowest balance are never saved: they are worked
+/// out from the list every time it arrives, so they can never be wrong.
+class WalletData {
+  WalletData(List<Transaction> newestFirst) : transactions = newestFirst;
+
+  /// Newest first, as Firestore returns them.
+  final List<Transaction> transactions;
+
+  /// Oldest first, so running balances make sense.
+  Iterable<Transaction> get chronological => transactions.reversed;
+
+  int get balance => transactions.fold(0, (b, t) => b + t.signedAmount);
+
+  int get totalIn =>
+      transactions.where((t) => t.isIn).fold(0, (total, t) => total + t.amount);
+
+  int get totalOut =>
+      transactions.where((t) => !t.isIn).fold(0, (total, t) => total + t.amount);
+
+  /// Lowest balance ever reached. The balance before the first saved
+  /// transaction is not counted: the opening balance is itself a document.
+  int get lowestBalance {
+    var b = 0;
+    int? lowest;
+    for (final t in chronological) {
+      b += t.signedAmount;
+      if (lowest == null || b < lowest) lowest = b;
     }
+    return lowest ?? 0;
   }
 
-  /// A wallet that starts at 10,000 RWF with sample history. The samples
-  /// cancel out, so the balance is still 10,000 but the statistics have
-  /// something to show (the lowest point was 8,000).
-  factory Wallet.sample({DateTime Function()? clock}) {
-    final now = (clock ?? DateTime.now)();
-    DateTime ago(int hours) => now.subtract(Duration(hours: hours));
-    return Wallet(clock: clock, history: [
-      Transaction(id: 1, type: TxType.outgoing, amount: 2000,
-          description: 'Sent to 0788123456', date: ago(72)),
-      Transaction(id: 2, type: TxType.incoming, amount: 5000,
-          description: 'Salary advance from Kigali Coffee', date: ago(50)),
-      Transaction(id: 3, type: TxType.incoming, amount: 1500,
-          description: 'Received from Aline', date: ago(26)),
-      Transaction(id: 4, type: TxType.outgoing, amount: 3000,
-          description: 'Cash out', date: ago(20)),
-      Transaction(id: 5, type: TxType.outgoing, amount: 1500,
-          description: 'Sent to 0791234567', date: ago(3)),
-    ]);
-  }
+  List<Transaction> newestFirst({TxType? filter}) => filter == null
+      ? transactions
+      : transactions.where((t) => t.type == filter).toList(growable: false);
 
-  /// Balance before the first transaction in the history.
-  final int openingBalance;
-  final List<Transaction> _txs; // chronological, oldest first
-  final DateTime Function() _clock;
-  late int _nextId;
-
-  // ---------------------------------------------------------------- reading
-
-  List<Transaction> get transactions => List.unmodifiable(_txs);
-
-  List<Transaction> newestFirst({TxType? filter}) => _txs.reversed
-      .where((t) => filter == null || t.type == filter)
-      .toList(growable: false);
-
-  Transaction? byId(int id) {
-    for (final t in _txs) {
+  Transaction? byId(String id) {
+    for (final t in transactions) {
       if (t.id == id) return t;
     }
     return null;
   }
 
-  int get balance => _txs.fold(openingBalance, (b, t) => b + t.signedAmount);
-
-  int get totalIn =>
-      _txs.where((t) => t.isIn).fold(0, (sum, t) => sum + t.amount);
-
-  int get totalOut =>
-      _txs.where((t) => !t.isIn).fold(0, (sum, t) => sum + t.amount);
-
-  /// Lowest balance ever reached. Starts at the opening balance, not 0:
-  /// the balance can never go below 0, so starting at 0 would always report 0.
-  int get lowestBalance {
-    var lowest = openingBalance;
-    var b = openingBalance;
-    for (final t in _txs) {
-      b += t.signedAmount;
-      if (b < lowest) lowest = b;
-    }
-    return lowest;
-  }
-
   /// The balance right after [tx] was applied.
   int balanceAfter(Transaction tx) {
-    var b = openingBalance;
-    for (final t in _txs) {
+    var b = 0;
+    for (final t in chronological) {
       b += t.signedAmount;
       if (t.id == tx.id) return b;
     }
-    throw StateError('transaction ${tx.id} is not in this wallet');
+    return b;
   }
 
   /// The fee attached to a send, if any.
   Transaction? feeOf(Transaction send) {
-    for (final t in _txs) {
+    for (final t in transactions) {
       if (t.feeFor == send.id) return t;
     }
     return null;
   }
+}
 
-  // ------------------------------------------------------------ moving money
-  //
-  // Every method validates everything first and only then touches _txs.
-  // A refusal leaves the wallet exactly as it was.
+// ---------------------------------------------------------------- Firestore
 
-  /// Receive money: whole number above 0, non-empty description.
-  Outcome<Transaction> receive(String amountText, String description) {
-    final amount = parseAmount(amountText);
-    if (!amount.ok) return Outcome.refused(amount.error!);
-    final desc = description.trim();
-    if (desc.isEmpty) return const Outcome.refused('Description cannot be empty');
+/// The signed-in user's transactions: users/{uid}/transactions
+CollectionReference<Map<String, dynamic>> myTransactions() {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection('transactions');
+}
 
-    final tx = _add(TxType.incoming, amount.value!, desc);
-    notifyListeners();
-    return Outcome.ok(tx);
+/// Sample data, written once when a new account is created.
+Future<void> addSampleTransactions() async {
+  final samples = [
+    Transaction(
+        id: '',
+        type: TxType.incoming,
+        amount: 10000,
+        description: 'Opening balance'),
+    Transaction(
+        id: '',
+        type: TxType.outgoing,
+        amount: 2500,
+        description: 'Sent to 0788123456'),
+    Transaction(
+        id: '',
+        type: TxType.incoming,
+        amount: 4000,
+        description: 'Received from Keza'),
+  ];
+  final batch = FirebaseFirestore.instance.batch();
+  for (final t in samples) {
+    batch.set(myTransactions().doc(), {
+      ...t.toMap(),
+      'createdAt': FieldValue.serverTimestamp(),
+    });
   }
+  await batch.commit();
+}
 
-  /// Send money to an 078/079 number. Adds the send and a separate 100 RWF fee.
-  Outcome<Transaction> send(String phoneText, String amountText) {
-    final phoneError = validatePhone(phoneText);
-    if (phoneError != null) return Outcome.refused(phoneError);
-    final amount = parseAmount(amountText);
-    if (!amount.ok) return Outcome.refused(amount.error!);
-    if (amount.value! < minSend) {
-      return Outcome.refused('Minimum send amount is ${formatRwf(minSend)} RWF');
-    }
-    if (amount.value! + sendFee > balance) {
-      return const Outcome.refused('Insufficient balance');
-    }
+/// Saves one new transaction (receive or cash out).
+Future<void> addTransaction({
+  required TxType type,
+  required int amount,
+  required String description,
+}) async {
+  await myTransactions().add({
+    'type': type.name,
+    'amount': amount,
+    'description': description,
+    'createdAt': FieldValue.serverTimestamp(),
+  });
+}
 
-    final phone = phoneText.trim();
-    final tx = _add(TxType.outgoing, amount.value!, 'Sent to $phone');
-    _add(TxType.outgoing, sendFee, 'Send fee ($phone)', feeFor: tx.id);
-    notifyListeners();
-    return Outcome.ok(tx);
-  }
+/// Saves a send plus its separate fee in one batch: both or none.
+Future<void> addSend({required String phone, required int amount}) async {
+  final batch = FirebaseFirestore.instance.batch();
+  final sendRef = myTransactions().doc();
+  batch.set(sendRef, {
+    'type': TxType.outgoing.name,
+    'amount': amount,
+    'description': 'Sent to $phone',
+    'createdAt': FieldValue.serverTimestamp(),
+  });
+  batch.set(myTransactions().doc(), {
+    'type': TxType.outgoing.name,
+    'amount': sendFee,
+    'description': 'Send fee ($phone)',
+    'feeFor': sendRef.id,
+    'createdAt': FieldValue.serverTimestamp(),
+  });
+  await batch.commit();
+}
 
-  /// Works out the notes for a cash out without moving any money.
-  Outcome<CashOutQuote> quoteCashOut(String amountText) {
-    final amount = parseAmount(amountText);
-    if (!amount.ok) return Outcome.refused(amount.error!);
-    final value = amount.value!;
-    if (value % 100 != 0) {
-      return const Outcome.refused(
-          'Amount must be a multiple of 100 RWF (the smallest note is 100)');
-    }
-    if (value > balance) return const Outcome.refused('Insufficient balance');
-    return Outcome.ok(CashOutQuote(value, splitIntoNotes(value)));
-  }
+/// Edits the facts the user typed on an existing document.
+Future<void> updateTransaction(
+  Transaction tx, {
+  required String description,
+  required int amount,
+}) async {
+  await myTransactions().doc(tx.id).update({
+    'description': description,
+    'amount': amount,
+  });
+}
 
-  /// Confirms a cash out. Re-checks everything: the balance may have changed
-  /// between the quote and the confirm.
-  Outcome<Transaction> confirmCashOut(CashOutQuote quote) {
-    final fresh = quoteCashOut('${quote.amount}');
-    if (!fresh.ok) return Outcome.refused(fresh.error!);
-
-    final tx = _add(TxType.outgoing, quote.amount, 'Cash out');
-    notifyListeners();
-    return Outcome.ok(tx);
-  }
-
-  // --------------------------------------------------------- delete & undo
-
-  /// Null if [id] can be deleted, otherwise the reason it cannot.
-  String? whyCannotDelete(int id) {
-    final target = byId(id);
-    if (target == null) return 'Transaction not found';
-    final ids = _idsRemovedWith(target);
-    final rest = _txs.where((t) => !ids.contains(t.id)).toList();
-    if (_runningBalances(rest) == null) {
-      return 'Cannot delete: the balance would go below 0 in the history';
-    }
-    return null;
-  }
-
-  /// Deletes a transaction (and, for a send, its fee). Refused if the
-  /// history without it would dip below 0 at any point.
-  Outcome<Deletion> delete(int id) {
-    final reason = whyCannotDelete(id);
-    if (reason != null) return Outcome.refused(reason);
-
-    final ids = _idsRemovedWith(byId(id)!);
-    final removed = _txs.where((t) => ids.contains(t.id)).toList();
-    _txs.removeWhere((t) => ids.contains(t.id));
-    notifyListeners();
-    return Outcome.ok(Deletion(removed));
-  }
-
-  /// Puts deleted transactions back in their original place. Also checked:
-  /// restoring an old OUT after the money was spent could go below 0.
-  Outcome<void> undo(Deletion deletion) {
-    final missing =
-        deletion.removed.where((t) => byId(t.id) == null).toList();
-    if (missing.isEmpty) return const Outcome.ok(null);
-
-    final restored = [..._txs, ...missing]..sort((a, b) => a.id.compareTo(b.id));
-    if (_runningBalances(restored) == null) {
-      return const Outcome.refused(
-          'Cannot undo: the balance would go below 0 in the history');
-    }
-    _txs
-      ..clear()
-      ..addAll(restored);
-    notifyListeners();
-    return const Outcome.ok(null);
-  }
-
-  // ---------------------------------------------------------------- helpers
-
-  Transaction _add(TxType type, int amount, String description, {int? feeFor}) {
-    final tx = Transaction(
-      id: _nextId++,
-      type: type,
-      amount: amount,
-      description: description,
-      date: _clock(),
-      feeFor: feeFor,
-    );
-    _txs.add(tx);
-    return tx;
-  }
-
-  Set<int> _idsRemovedWith(Transaction target) =>
-      {target.id, ..._txs.where((t) => t.feeFor == target.id).map((t) => t.id)};
-
-  /// Running balances for [txs], or null if any of them is below 0.
-  List<int>? _runningBalances(List<Transaction> txs) {
-    var b = openingBalance;
-    final out = <int>[];
-    for (final t in txs) {
-      b += t.signedAmount;
-      if (b < 0) return null;
-      out.add(b);
-    }
-    return out;
-  }
+/// Deletes [tx], and its fee document when [fee] is given.
+Future<void> deleteTransaction(Transaction tx, {Transaction? fee}) async {
+  final batch = FirebaseFirestore.instance.batch();
+  batch.delete(myTransactions().doc(tx.id));
+  if (fee != null) batch.delete(myTransactions().doc(fee.id));
+  await batch.commit();
 }

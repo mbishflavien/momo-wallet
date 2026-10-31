@@ -75,17 +75,18 @@ class ErrorBox extends StatelessWidget {
 
 /// Shows the available balance at the top of the money-moving screens.
 class AvailableBalance extends StatelessWidget {
-  const AvailableBalance(this.wallet, {super.key});
-  final Wallet wallet;
+  const AvailableBalance(this.balance, {super.key});
+  final int balance;
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: wallet,
-      builder: (context, _) => Text(
-        'Available: ${formatRwf(wallet.balance)} RWF',
-        style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.black54),
-      ),
+    return Text(
+      'Available: ${formatRwf(balance)} RWF',
+      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.black54),
     );
   }
 }
+
+/// The saved date, or a placeholder while the server timestamp is pending.
+String dateLabel(Transaction t) =>
+    t.createdAt == null ? 'Saving…' : formatDate(t.createdAt!);

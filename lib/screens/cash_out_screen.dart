@@ -4,8 +4,8 @@ import '../ui.dart';
 import '../wallet.dart';
 
 class CashOutScreen extends StatefulWidget {
-  const CashOutScreen({super.key, required this.wallet});
-  final Wallet wallet;
+  const CashOutScreen({super.key, required this.data});
+  final WalletData data;
 
   @override
   State<CashOutScreen> createState() => _CashOutScreenState();
@@ -15,6 +15,7 @@ class _CashOutScreenState extends State<CashOutScreen> {
   final _amount = TextEditingController();
   CashOutQuote? _quote;
   String? _error;
+  bool _busy = false;
 
   @override
   void dispose() {
@@ -22,25 +23,61 @@ class _CashOutScreenState extends State<CashOutScreen> {
     super.dispose();
   }
 
+  Outcome<CashOutQuote> _quoteCashOut(String amountText) {
+    final amount = parseAmount(amountText);
+    if (!amount.ok) return Outcome.refused(amount.error!);
+    final value = amount.value!;
+    if (value % 100 != 0) {
+      return const Outcome.refused(
+          'Amount must be a multiple of 100 RWF (the smallest note is 100)');
+    }
+    if (value > widget.data.balance) {
+      return const Outcome.refused('Insufficient balance');
+    }
+    return Outcome.ok(CashOutQuote(value, splitIntoNotes(value)));
+  }
+
   void _showNotes() {
     FocusScope.of(context).unfocus(); // close the keyboard so the notes are visible
-    final result = widget.wallet.quoteCashOut(_amount.text);
+    final result = _quoteCashOut(_amount.text);
     setState(() {
       _quote = result.value;
       _error = result.error;
     });
   }
 
-  void _confirm() {
-    final result = widget.wallet.confirmCashOut(_quote!);
-    if (!result.ok) {
+  Future<void> _confirm() async {
+    final quote = _quote!;
+    // Re-check: the balance may have changed since the quote was shown.
+    final fresh = _quoteCashOut('${quote.amount}');
+    if (!fresh.ok) {
       setState(() {
         _quote = null;
-        _error = result.error;
+        _error = fresh.error;
       });
       return;
     }
-    Navigator.of(context).pop('Cash out: ${formatRwf(result.value!.amount)} RWF');
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await addTransaction(
+        type: TxType.outgoing,
+        amount: quote.amount,
+        description: 'Cash out',
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop('Cash out: ${formatRwf(quote.amount)} RWF');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = 'Could not cash out: $e';
+        });
+      }
+    }
   }
 
   @override
@@ -60,7 +97,7 @@ class _CashOutScreenState extends State<CashOutScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  AvailableBalance(widget.wallet),
+                  AvailableBalance(widget.data.balance),
                   const SizedBox(height: 12),
                   TextField(
                     key: const Key('cashout-amount'),
@@ -110,7 +147,7 @@ class _CashOutScreenState extends State<CashOutScreen> {
                 )
               : FilledButton.icon(
                   key: const Key('cashout-confirm'),
-                  onPressed: _confirm,
+                  onPressed: _busy ? null : _confirm,
                   icon: const Icon(Icons.check),
                   label: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 12),

@@ -3,18 +3,17 @@ import 'package:flutter/material.dart';
 import '../ui.dart';
 import '../wallet.dart';
 
-/// Asks for an amount and a description, and adds an IN.
+/// Asks for an amount and a description, and saves an IN to Firestore.
 /// Returns a success message, or null if cancelled.
-Future<String?> showReceiveDialog(BuildContext context, Wallet wallet) {
+Future<String?> showReceiveDialog(BuildContext context) {
   return showDialog<String>(
     context: context,
-    builder: (_) => _ReceiveDialog(wallet: wallet),
+    builder: (_) => const _ReceiveDialog(),
   );
 }
 
 class _ReceiveDialog extends StatefulWidget {
-  const _ReceiveDialog({required this.wallet});
-  final Wallet wallet;
+  const _ReceiveDialog();
 
   @override
   State<_ReceiveDialog> createState() => _ReceiveDialogState();
@@ -24,6 +23,7 @@ class _ReceiveDialogState extends State<_ReceiveDialog> {
   final _amount = TextEditingController();
   final _description = TextEditingController();
   String? _error;
+  bool _busy = false;
 
   @override
   void dispose() {
@@ -32,13 +32,38 @@ class _ReceiveDialogState extends State<_ReceiveDialog> {
     super.dispose();
   }
 
-  void _submit() {
-    final result = widget.wallet.receive(_amount.text, _description.text);
-    if (!result.ok) {
-      setState(() => _error = result.error);
+  Future<void> _submit() async {
+    final amount = parseAmount(_amount.text);
+    if (!amount.ok) {
+      setState(() => _error = amount.error);
       return;
     }
-    Navigator.of(context).pop('Received ${formatRwf(result.value!.amount)} RWF');
+    final description = _description.text.trim();
+    if (description.isEmpty) {
+      setState(() => _error = 'Description cannot be empty');
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await addTransaction(
+        type: TxType.incoming,
+        amount: amount.value!,
+        description: description,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop('Received ${formatRwf(amount.value!)} RWF');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = 'Could not save: $e';
+        });
+      }
+    }
   }
 
   @override
@@ -75,8 +100,11 @@ class _ReceiveDialogState extends State<_ReceiveDialog> {
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
-        FilledButton(onPressed: _submit, child: const Text('Receive')),
+        TextButton(
+            onPressed: _busy ? null : () => Navigator.of(context).pop(),
+            child: const Text('Cancel')),
+        FilledButton(
+            onPressed: _busy ? null : _submit, child: const Text('Receive')),
       ],
     );
   }
