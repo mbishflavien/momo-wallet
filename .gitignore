@@ -46,6 +46,3 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
-
-# Local web Firebase config (copy firebase-web.example.json)
-firebase-web.json
